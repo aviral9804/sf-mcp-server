@@ -1,0 +1,16 @@
+---
+applications:
+  - name: mcp-successfactors
+    memory: 256M
+    disk_quota: 512M
+    instances: 1
+    buildpacks:
+      - python_buildpack
+    command: python server.py
+    health-check-type: port
+    env:
+      MCP_TRANSPORT: sse
+      # SF credentials: set these via cf set-env (do not commit real values here)
+      # cf set-env mcp-successfactors SF_BASE_URL https://api4.successfactors.com/odata/v2
+      # cf set-env mcp-successfactors SF_USERNAME admin@COMPANY_ID
+      # cf set-env mcp-successfactors SF_PASSWORD your_password
