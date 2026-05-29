@@ -7,6 +7,8 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
@@ -101,6 +103,72 @@ def _sf_get(entity: str, params: dict) -> dict:
 
     response.raise_for_status()
     return response.json()
+
+
+# ---------------------------------------------------------------------------
+# XSUAA helpers (OAuth proxy)
+# ---------------------------------------------------------------------------
+
+def _xsuaa_creds() -> dict:
+    """Read XSUAA credentials from VCAP_SERVICES (bound service loa-rag-xsuaa)."""
+    vcap = json.loads(os.environ.get("VCAP_SERVICES", "{}"))
+    instances = vcap.get("xsuaa", [])
+    if not instances:
+        raise RuntimeError("XSUAA service not bound — check VCAP_SERVICES")
+    return instances[0]["credentials"]
+
+
+# ---------------------------------------------------------------------------
+# OAuth proxy routes — required for Claude.ai MCP custom connector
+# These proxy the OAuth flow to the bound XSUAA service instance.
+# Joule and other BTP callers are unaffected (they hit /sse directly).
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_metadata(request: Request) -> Response:
+    """RFC 8414 metadata — tells Claude.ai where XSUAA's OAuth endpoints are."""
+    creds = _xsuaa_creds()
+    url = creds["url"].rstrip("/")
+    return JSONResponse({
+        "issuer": url,
+        "authorization_endpoint": f"{url}/oauth/authorize",
+        "token_endpoint": f"{url}/oauth/token",
+        "jwks_uri": f"{url}/token_keys",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+    })
+
+
+@mcp.custom_route("/authorize", methods=["GET"])
+async def oauth_authorize(request: Request) -> Response:
+    """Redirect the browser to XSUAA's authorization endpoint."""
+    creds = _xsuaa_creds()
+    xsuaa_url = f"{creds['url'].rstrip('/')}/oauth/authorize"
+    return RedirectResponse(f"{xsuaa_url}?{request.url.query}")
+
+
+@mcp.custom_route("/token", methods=["POST"])
+async def oauth_token(request: Request) -> Response:
+    """Proxy the authorization-code → token exchange to XSUAA."""
+    creds = _xsuaa_creds()
+    xsuaa_token_url = f"{creds['url'].rstrip('/')}/oauth/token"
+
+    form_data = await request.form()
+    # Forward Authorization header if present (Basic client_id:secret)
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+    if auth := request.headers.get("Authorization"):
+        headers["Authorization"] = auth
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(xsuaa_token_url, data=dict(form_data), headers=headers, timeout=30)
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 # ---------------------------------------------------------------------------
