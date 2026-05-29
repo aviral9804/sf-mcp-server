@@ -1,0 +1,30 @@
+_schema-version: "3.1"
+ID: mcp-successfactors
+version: 1.0.0
+description: MCP Server for SAP SuccessFactors
+
+modules:
+  - name: mcp-successfactors
+    type: application
+    path: .
+    parameters:
+      memory: 256M
+      disk-quota: 512M
+      buildpack: python_buildpack
+      command: python server.py
+      health-check-type: port
+    properties:
+      MCP_TRANSPORT: sse
+    requires:
+      - name: dest-service
+      - name: xsuaa-service
+
+resources:
+  - name: dest-service
+    type: org.cloudfoundry.existing-service
+    parameters:
+      service-name: hrff_des_service
+  - name: xsuaa-service
+    type: org.cloudfoundry.existing-service
+    parameters:
+      service-name: loa-rag-xsuaa

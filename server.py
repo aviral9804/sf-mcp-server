@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -11,18 +12,93 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 mcp = FastMCP("SuccessFactors")
 
+# In-memory cache for the Destination Service OAuth token so we don't
+# fetch a new one on every SF API call. Refreshed 60s before expiry.
+_token_cache: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# BTP Destination Service helpers
+# ---------------------------------------------------------------------------
+
+def _dest_creds() -> dict:
+    """
+    Read Destination Service credentials from VCAP_SERVICES.
+    CF injects this at runtime when the app is bound to the service.
+    Contains: clientid, clientsecret, url (token endpoint), uri (API base).
+    """
+    vcap = json.loads(os.environ.get("VCAP_SERVICES", "{}"))
+    instances = vcap.get("destination", [])
+    if not instances:
+        raise RuntimeError("Destination service not bound — check VCAP_SERVICES")
+    return instances[0]["credentials"]
+
+
+def _dest_token() -> str:
+    """
+    Fetch a short-lived OAuth token from the Destination Service using
+    client_credentials grant. Cached in memory until 60s before expiry.
+    """
+    cached = _token_cache.get("dest")
+    if cached and cached["exp"] > time.time() + 60:
+        return cached["value"]
+
+    creds = _dest_creds()
+    resp = httpx.post(
+        f"{creds['url']}/oauth/token",
+        data={"grant_type": "client_credentials"},
+        auth=(creds["clientid"], creds["clientsecret"]),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _token_cache["dest"] = {
+        "value": data["access_token"],
+        "exp": time.time() + int(data.get("expires_in", 3600)),
+    }
+    return data["access_token"]
+
+
+def _fetch_destination(name: str) -> dict:
+    """
+    Look up a named BTP Destination via the Destination Service REST API.
+    Response includes the target URL and a pre-resolved auth header
+    (Basic or Bearer) that can be forwarded directly to the target system.
+    """
+    creds = _dest_creds()
+    resp = httpx.get(
+        f"{creds['uri']}/destination-configuration/v1/destinations/{name}",
+        headers={"Authorization": f"Bearer {_dest_token()}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
 
 def _sf_get(entity: str, params: dict) -> dict:
-    base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
-    username = os.environ.get("SF_USERNAME", "")
-    password = os.environ.get("SF_PASSWORD", "")
-    if not base_url or not username or not password:
-        raise ValueError(
-            "SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment"
-        )
+    """
+    GET request to SuccessFactors OData API.
+    - On BTP/CF (VCAP_SERVICES present): resolves URL + auth via HRFF_Dev destination.
+    - Locally: falls back to SF_BASE_URL / SF_USERNAME / SF_PASSWORD from .env.
+    """
     params["$format"] = "json"
-    url = f"{base_url}/{entity}"
-    response = httpx.get(url, params=params, auth=(username, password), timeout=30)
+
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        # authTokens[0] is the pre-resolved auth header — forward it as-is
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+        url = f"{base_url}/{entity}"
+        response = httpx.get(url, params=params, headers={"Authorization": auth_header}, timeout=30)
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        url = f"{base_url}/{entity}"
+        response = httpx.get(url, params=params, auth=(username, password), timeout=30)
+
     response.raise_for_status()
     return response.json()
 
