@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
-mcp = FastMCP("SuccessFactors")
+mcp = FastMCP("SuccessFactors", host="0.0.0.0")
 
 # In-memory cache for the Destination Service OAuth token so we don't
 # fetch a new one on every SF API call. Refreshed 60s before expiry.
@@ -110,11 +110,14 @@ def _sf_get(entity: str, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _xsuaa_creds() -> dict:
-    """Read XSUAA credentials from VCAP_SERVICES (bound service loa-rag-xsuaa)."""
+    """Read XSUAA credentials from VCAP_SERVICES (bound service sf_mcp-xsuaa)."""
     vcap = json.loads(os.environ.get("VCAP_SERVICES", "{}"))
     instances = vcap.get("xsuaa", [])
     if not instances:
         raise RuntimeError("XSUAA service not bound — check VCAP_SERVICES")
+    for inst in instances:
+        if inst.get("name") == "sf_mcp-xsuaa":
+            return inst["credentials"]
     return instances[0]["credentials"]
 
 
@@ -123,6 +126,21 @@ def _xsuaa_creds() -> dict:
 # These proxy the OAuth flow to the bound XSUAA service instance.
 # Joule and other BTP callers are unaffected (they hit /sse directly).
 # ---------------------------------------------------------------------------
+
+@mcp.custom_route("/", methods=["GET"])
+async def health(request: Request) -> Response:
+    return JSONResponse({"status": "ok", "service": "mcp-successfactors"})
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def oauth_protected_resource(request: Request) -> Response:
+    """RFC 9728 — tells clients which auth server protects this resource."""
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "resource": base,
+        "authorization_servers": [base],
+    })
+
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_metadata(request: Request) -> Response:
@@ -138,6 +156,25 @@ async def oauth_metadata(request: Request) -> Response:
         "grant_types_supported": ["authorization_code", "client_credentials"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+    })
+
+
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+async def openid_configuration(request: Request) -> Response:
+    """OpenID Connect discovery — same metadata, alternate well-known path."""
+    creds = _xsuaa_creds()
+    url = creds["url"].rstrip("/")
+    return JSONResponse({
+        "issuer": url,
+        "authorization_endpoint": f"{url}/oauth/authorize",
+        "token_endpoint": f"{url}/oauth/token",
+        "jwks_uri": f"{url}/token_keys",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
     })
 
 
@@ -178,16 +215,32 @@ async def oauth_token(request: Request) -> Response:
 
 @mcp.tool()
 def sf_debug() -> str:
-    """Check environment and .env file state (no credentials exposed)."""
+    """Check environment and SF connection state (no credentials exposed)."""
     env_path = Path(__file__).parent / ".env"
-    return json.dumps({
+    vcap = json.loads(os.environ.get("VCAP_SERVICES", "{}"))
+
+    result: dict = {
+        "mode": "CF/VCAP_SERVICES" if os.environ.get("VCAP_SERVICES") else "local/.env",
+        "VCAP_SERVICES_set": bool(os.environ.get("VCAP_SERVICES")),
+        "destination_service_bound": bool(vcap.get("destination")),
+        "xsuaa_service_bound": bool(vcap.get("xsuaa")),
         "SF_BASE_URL_set": bool(os.environ.get("SF_BASE_URL")),
         "SF_USERNAME_set": bool(os.environ.get("SF_USERNAME")),
         "SF_PASSWORD_set": bool(os.environ.get("SF_PASSWORD")),
-        "dotenv_path": str(env_path),
         "dotenv_exists": env_path.exists(),
-        "SF_BASE_URL_value": os.environ.get("SF_BASE_URL", "NOT SET"),
-    }, indent=2)
+    }
+
+    if vcap.get("destination"):
+        try:
+            dest = _fetch_destination("HRFF_Dev")
+            cfg = dest.get("destinationConfiguration", {})
+            result["HRFF_Dev_url"] = cfg.get("URL", "NOT FOUND")
+            result["HRFF_Dev_auth_type"] = cfg.get("Authentication", "NOT FOUND")
+            result["HRFF_Dev_auth_token_available"] = bool(dest.get("authTokens"))
+        except Exception as e:
+            result["HRFF_Dev_error"] = str(e)
+
+    return json.dumps(result, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +506,226 @@ def sf_get_time_account_balance(
     return json.dumps(result, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Org-entity validation tool
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def sf_validate_org_entities(
+    business_unit_name: str,
+    department_name: str,
+    location_name: str,
+) -> str:
+    """Validate that a Business Unit, Department, and Location all exist and are active
+    in SAP SuccessFactors EC, using human-readable names as provided by the HRBP.
+
+    Returns each entity's matching record(s) including externalCode for downstream use.
+    If multiple matches are found for any entity, all are returned so the agent can ask
+    the HRBP to disambiguate. Call this before any position creation or update work.
+
+    Args:
+        business_unit_name: Human-readable name of the Business Unit (e.g. "Corporate Finance")
+        department_name: Human-readable name of the Department (e.g. "Accounts Payable")
+        location_name: Human-readable name of the Location (e.g. "New York - 30 Rockefeller")
+    """
+
+    def _escape(value: str) -> str:
+        # Escape single quotes in OData string literals
+        return value.replace("'", "''")
+
+    def _search_fo(entity: str, name: str, select: str, name_field: str = "name_defaultValue") -> dict:
+        escaped = _escape(name)
+        name_lower = name.lower()
+
+        # Try OData server-side filter first (exact match, then substring)
+        params: dict = {
+            "$filter": f"status eq 'A' and {name_field} eq '{escaped}'",
+            "$select": select,
+            "$top": "10",
+        }
+        try:
+            data = _sf_get(entity, params)
+            records = data.get("d", {}).get("results", [])
+            if not records:
+                params["$filter"] = f"status eq 'A' and substringof('{escaped}', {name_field})"
+                data = _sf_get(entity, params)
+                records = data.get("d", {}).get("results", [])
+            return {"found": bool(records), "match_count": len(records), "records": records}
+        except httpx.HTTPStatusError as exc:
+            sf_error = exc.response.text[:500] if exc.response.text else str(exc)
+            if exc.response.status_code != 400:
+                return {"found": False, "match_count": 0, "records": [], "error": sf_error}
+            # 400 — fall through to client-side match, but capture the SF error detail
+            sf_400_detail = sf_error
+        except Exception as exc:
+            return {"found": False, "match_count": 0, "records": [], "error": str(exc)}
+
+        # Client-side fallback: fetch all active records and match by name in Python
+        try:
+            data = _sf_get(entity, {"$filter": "status eq 'A'", "$select": select, "$top": "500"})
+            all_records = data.get("d", {}).get("results", [])
+            exact = [r for r in all_records if r.get(name_field, "").lower() == name_lower]
+            records = exact or [r for r in all_records if name_lower in r.get(name_field, "").lower()]
+            return {"found": bool(records), "match_count": len(records), "records": records}
+        except httpx.HTTPStatusError as exc:
+            sf_error = exc.response.text[:500] if exc.response.text else str(exc)
+            return {"found": False, "match_count": 0, "records": [], "error": f"filter_error: {sf_400_detail} | fallback_error: {sf_error}"}
+        except Exception as exc:
+            return {"found": False, "match_count": 0, "records": [], "error": f"filter_error: {sf_400_detail} | fallback_error: {str(exc)}"}
+
+    def _resolve_status(result: dict) -> str:
+        if "error" in result:
+            return "error"
+        if not result["found"]:
+            return "not_found"
+        if result["match_count"] > 1:
+            return "multiple_matches"
+        return "ok"
+    
+    def _top_level_code(result: dict) -> str | None:
+        """Pull externalCode to top level when there's exactly one match."""
+        if result["match_count"] == 1:
+            return result["records"][0].get("externalCode")
+        return None
+
+    bu = _search_fo(
+        "FOBusinessUnit",
+        business_unit_name,
+        "externalCode,name_defaultValue,status,startDate,endDate",
+    )
+    dept = _search_fo(
+        "FODepartment",
+        department_name,
+        "externalCode,name_defaultValue,status,startDate,endDate,costCenter,cust_Division",
+    )
+    loc = _search_fo(
+        "FOLocation",
+        location_name,
+        "externalCode,name,status,startDate,endDate",
+         name_field="name"
+    )
+
+    output = {
+    "all_valid": all(_resolve_status(r) == "ok" for r in [bu, dept, loc]),
+    "business_unit": {
+        "queried_name":  business_unit_name,
+        "status":        _resolve_status(bu),
+        "externalCode":  _top_level_code(bu),   # ← agent uses this directly
+        **bu
+    },
+    "department": {
+        "queried_name":  department_name,
+        "status":        _resolve_status(dept),
+        "externalCode":  _top_level_code(dept),
+        "costCenter":    dept["records"][0].get("costCenter") if dept["match_count"] == 1 else None,
+        "division":      dept["records"][0].get("cust_Division") if dept["match_count"] == 1 else None,
+        **dept
+    },
+    "location": {
+        "queried_name":  location_name,
+        "status":        _resolve_status(loc),
+        "externalCode":  _top_level_code(loc),
+        **loc
+    },
+}
+    return json.dumps(output, indent=2)
+
+@mcp.tool()
+def ec_scan_vacant_positions(
+    dept_id: str,
+    location: str,
+) -> str:
+    """
+    Returns all active positions in a department and location, split into
+    vacant and occupied lists using the position's own vacant flag.
+    Always call this before creating any new positions — the HRBP must
+    review vacants and decide whether to repurpose them first.
+
+    Args:
+        dept_id: externalCode of the department (from sf_validate_org_entities)
+        location: Location externalCode OR human-readable location name.
+                  Tried in order: exact code match → exact name match →
+                  partial name match, all filtered server-side.
+    """
+    loc_escaped = location.replace("'", "''")
+    base_filter = f"department eq '{dept_id}' and positionCriticality ne 'I'"
+    select = (
+        "code,externalName_defaultValue,jobCode,vacant,"
+        "department,businessUnit,costCenter,location,parentPosition"
+    )
+
+    attempts = []
+    page_size = 100
+
+    def _query(location_filter: str) -> list | None:
+        """Returns all matching records (paginated), None on 400, raises on other errors."""
+        combined_filter = f"{base_filter} and {location_filter}"
+        all_records: list = []
+        skip = 0
+        while True:
+            params = {
+                "$filter": combined_filter,
+                "$select": select,
+                "$top": str(page_size),
+                "$skip": str(skip),
+            }
+            try:
+                data = _sf_get("Position", params)
+                raw = data.get("d", {}).get("results", [])
+                all_records.extend(
+                    [{k: v for k, v in p.items() if k != "__metadata"} for p in raw]
+                )
+                if len(raw) < page_size:
+                    break
+                skip += page_size
+            except httpx.HTTPStatusError as exc:
+                attempts.append({
+                    "filter": params["$filter"],
+                    "http_status": exc.response.status_code,
+                    "sf_error": exc.response.text[:500],
+                })
+                if exc.response.status_code == 400:
+                    return None
+                raise
+        return all_records
+
+    # 1. Exact code match
+    positions = _query(f"location eq '{loc_escaped}'")
+
+    # 2. Exact name match via navigation property
+    if positions is None or positions == []:
+        positions = _query(f"locationNav/name eq '{loc_escaped}'")
+
+    # 3. Partial name match
+    if positions is None or positions == []:
+        positions = _query(f"substringof('{loc_escaped}', locationNav/name)")
+
+    if positions is None:
+        return json.dumps({"error": "all_queries_failed", "attempts": attempts}, indent=2)
+
+    vacant   = [p for p in positions if p.get("vacant") is True]
+    occupied = [p for p in positions if p.get("vacant") is not True]
+
+    return json.dumps({
+        "total":          len(positions),
+        "vacant":         vacant,
+        "occupied_count": len(occupied),
+        **({"debug_attempts": attempts} if attempts else {}),
+    }, indent=2)
+
+
 if __name__ == "__main__":
+    import uvicorn
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "sse":
         port = int(os.environ.get("PORT", 8080))
-        mcp.settings.host = "0.0.0.0"
-        mcp.settings.port = port
-        mcp.run(transport="sse")
+        uvicorn.run(
+            mcp.streamable_http_app(),
+            host="0.0.0.0",
+            port=port,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
     else:
         mcp.run()

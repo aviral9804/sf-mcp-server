@@ -12,4 +12,4 @@ applications:
       MCP_TRANSPORT: sse
     services:
       - hrff_des_service
-      - loa-rag-xsuaa
+      - sf_mcp-xsuaa

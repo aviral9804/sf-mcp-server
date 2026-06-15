@@ -1,0 +1,9 @@
+  {
+    "xsappname": "sf_mcp-xsuaa",
+    "tenant-mode": "dedicated",
+    "oauth2-configuration": {
+      "redirect-uris": [
+        "https://claude.ai/api/mcp/auth_callback"
+      ]
+    }
+  }

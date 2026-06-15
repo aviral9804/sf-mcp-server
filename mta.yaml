@@ -17,14 +17,9 @@ modules:
       MCP_TRANSPORT: sse
     requires:
       - name: dest-service
-      - name: xsuaa-service
 
 resources:
   - name: dest-service
     type: org.cloudfoundry.existing-service
     parameters:
-      service-name: hrff_des_service
-  - name: xsuaa-service
-    type: org.cloudfoundry.existing-service
-    parameters:
-      service-name: loa-rag-xsuaa
+      service-name: HRFF_Dev
