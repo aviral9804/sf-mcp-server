@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -669,6 +670,7 @@ def ec_scan_vacant_positions(
                 "$select": select,
                 "$top": str(page_size),
                 "$skip": str(skip),
+                "$expand": "parentPosition",
             }
             try:
                 data = _sf_get("Position", params)
@@ -706,6 +708,68 @@ def ec_scan_vacant_positions(
 
     vacant   = [p for p in positions if p.get("vacant") is True]
     occupied = [p for p in positions if p.get("vacant") is not True]
+
+    # ------------------------------------------------------------------
+    # Resolve parent position code from each vacant position.
+    # $expand=parentPosition asks SF to return the full parent object
+    # inline, but some instances still return a deferred link:
+    #   {"__deferred": {"uri": "...Position('CODE')"}}
+    # _extract handles all three shapes: expanded object, deferred link,
+    # or a plain string code.
+    # ------------------------------------------------------------------
+    def _extract_parent_code(pos: dict) -> str | None:
+        pp = pos.get("parentPosition")
+        if not pp or not isinstance(pp, dict):
+            return pp if isinstance(pp, str) and pp else None
+        # Expanded inline — SF returned the full Position object
+        if "code" in pp:
+            return pp["code"]
+        # Deferred link — parse the code out of the URI string
+        if "__deferred" in pp:
+            m = re.search(r"Position\('([^']+)'\)", pp["__deferred"].get("uri", ""))
+            return m.group(1) if m else None
+        return None
+
+    parent_codes: list[str] = []
+    for pos in vacant:
+        code = _extract_parent_code(pos)
+        if code:
+            pos["parentPositionCode"] = code
+            if code not in parent_codes:
+                parent_codes.append(code)
+
+    manager_map: dict = {}
+    if parent_codes:
+        or_parts = " or ".join(f"position eq '{c}'" for c in parent_codes[:10])
+        try:
+            emp_data = _sf_get("EmpJob", {
+                "$filter": f"({or_parts}) and endDate eq datetime'9999-12-31T00:00:00'",
+                "$select": "userId,position",
+                "$top": "50",
+            })
+            for rec in emp_data.get("d", {}).get("results", []):
+                pc = rec.get("position", "")
+                manager_map.setdefault(pc, []).append(rec.get("userId"))
+        except Exception:
+            # Fallback: fetch without endDate filter and keep 9999 records in Python
+            try:
+                emp_data = _sf_get("EmpJob", {
+                    "$filter": f"({or_parts})",
+                    "$select": "userId,position,endDate",
+                    "$top": "100",
+                })
+                for rec in emp_data.get("d", {}).get("results", []):
+                    pc = rec.get("position", "")
+                    end = str(rec.get("endDate", "") or "")
+                    if "9999" in end or not end:
+                        manager_map.setdefault(pc, []).append(rec.get("userId"))
+            except Exception as exc:
+                manager_map["_lookup_error"] = str(exc)
+
+    for pos in vacant:
+        parent_code = pos.get("parentPositionCode")
+        if parent_code:
+            pos["manager_userIds"] = manager_map.get(parent_code, [])
 
     return json.dumps({
         "total":          len(positions),
