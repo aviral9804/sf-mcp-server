@@ -779,6 +779,222 @@ def ec_scan_vacant_positions(
     }, indent=2)
 
 
+@mcp.tool()
+def sf_update_position(
+    position_code: str,
+    effective_start_date: str,
+    position_title: str = None,
+    job_code: str = None,
+) -> str:
+    """Update the position title and/or job code of a position in SAP SuccessFactors.
+    At least one of position_title or job_code must be provided.
+
+    Args:
+        position_code: externalCode of the position to update (e.g. '40000358')
+        effective_start_date: Effective date for the new record, YYYY-MM-DD (e.g. '2026-06-16')
+        position_title: New position title to set (e.g. 'Data Scientist'). Optional.
+        job_code: Job code to assign to the position (e.g. 'JC_1001'). Optional.
+    """
+    if not position_title and not job_code:
+        return json.dumps({"success": False, "message": "At least one of position_title or job_code must be provided."})
+
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        import base64
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = f"Basic {credentials}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": auth_header,
+    }
+
+    # Fetch CSRF token
+    csrf_resp = httpx.get(
+        f"{base_url}/Position",
+        headers={**headers, "x-csrf-token": "fetch"},
+        params={"$top": "1", "$format": "json"},
+        timeout=15,
+    )
+    csrf_token = csrf_resp.headers.get("x-csrf-token", "")
+    if not csrf_token:
+        return json.dumps({"success": False, "message": "CSRF token not returned by SF"})
+
+    headers["x-csrf-token"] = csrf_token
+
+    # Convert YYYY-MM-DD to /Date(epoch_ms)/ format required by SF OData v2
+    from datetime import datetime, timezone
+    epoch_ms = int(datetime.strptime(effective_start_date, "%Y-%m-%d")
+                   .replace(tzinfo=timezone.utc)
+                   .timestamp() * 1000)
+
+    # Build upsert payload with only the fields being updated
+    payload = {
+        "__metadata": {
+            "uri": f"Position(code='{position_code}',effectiveStartDate=datetime'{effective_start_date}T00:00:00')",
+            "type": "SFOData.Position"
+        },
+        "code": position_code,
+        "effectiveStartDate": f"/Date({epoch_ms})/",
+    }
+
+    if position_title:
+        payload["externalName_defaultValue"] = position_title
+        payload["externalName_en_US"] = position_title
+
+    if job_code:
+        payload["jobCode"] = job_code
+
+    upsert_resp = httpx.post(
+        f"{base_url}/upsert",
+        headers=headers,
+        params={"purgeType": "incremental", "$format": "json"},
+        json=payload,
+        timeout=15,
+    )
+
+    try:
+        return json.dumps(upsert_resp.json())
+    except Exception:
+        return json.dumps({
+            "status_code": upsert_resp.status_code,
+            "message": upsert_resp.text
+        })
+
+
+@mcp.tool()
+def sf_create_position(
+    effective_start_date: str,
+    position_title: str,
+    company: str,
+    business_unit: str,
+    division: str,
+    department: str,
+    cost_center: str,
+    job_code: str,
+    location: str,
+    hiring_manager_user_id: str,
+    standard_hours: float = 40.0,
+    target_fte: float = 1.0,
+) -> str:
+    """Create a brand-new Position in SAP SuccessFactors EC.
+
+    An 8-digit position code is auto-generated in the range 50000000–59999999
+    (reserved for agent-created positions; avoids collision with manually
+    created codes which are typically in the 4xxxxxxx range).
+    The position is created as vacant=true, multipleIncumbentsAllowed=false.
+
+    Args:
+        effective_start_date:     Effective date for the position, YYYY-MM-DD (e.g. '2026-01-01').
+        position_title:           Human-readable position title (e.g. 'Data Analyst').
+        company:                  Company code (e.g. 'US01').
+        business_unit:            Business Unit externalCode (e.g. '10001').
+        division:                 Division externalCode (e.g. '20001').
+        department:               Department externalCode (e.g. '30000054').
+        cost_center:              Cost Center code (e.g. '3000987654').
+        job_code:                 Job Code externalCode (e.g. 'Accountant').
+        location:                 Location externalCode (e.g. 'US01').
+        hiring_manager_user_id:   userId of the hiring manager (e.g. '6000002').
+        standard_hours:           Weekly standard hours (default: 40).
+        target_fte:               Target FTE headcount (default: 1).
+    """
+    import random
+
+    # --- Auto-generate 8-digit position code (50000000–59999999) ---
+    ts_part = int(time.time()) % 9000000
+    rand_part = random.randint(0, 99)
+    position_code = str(50000000 + (ts_part * 100 + rand_part) % 9999999)
+
+    # --- Auth + CSRF (same pattern as sf_update_position) ---
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        import base64
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = f"Basic {credentials}"
+
+    csrf_resp = httpx.get(
+        f"{base_url}/Position",
+        headers={"Authorization": auth_header, "x-csrf-token": "fetch"},
+        params={"$top": "1", "$format": "json"},
+        timeout=15,
+    )
+    csrf_token = csrf_resp.headers.get("x-csrf-token", "")
+    if not csrf_token:
+        return json.dumps({"success": False, "position_code": position_code, "message": "CSRF token not returned by SF"})
+
+    # --- Epoch date conversion ---
+    from datetime import datetime, timezone
+    epoch_ms = int(datetime.strptime(effective_start_date, "%Y-%m-%d")
+                   .replace(tzinfo=timezone.utc)
+                   .timestamp() * 1000)
+
+    payload = {
+        "__metadata": {
+            "uri": f"Position(code='{position_code}',effectiveStartDate=datetime'{effective_start_date}T00:00:00')",
+            "type": "SFOData.Position",
+        },
+        "code": position_code,
+        "effectiveStartDate": f"/Date({epoch_ms})/",
+        "externalName_defaultValue": position_title,
+        "externalName_en_US": position_title,
+        "company": company,
+        "businessUnit": business_unit,
+        "division": division,
+        "department": department,
+        "costCenter": cost_center,
+        "jobCode": job_code,
+        "location": location,
+        "cust_hiringmanager": hiring_manager_user_id,
+        "standardHours": standard_hours,
+        "targetFTE": target_fte,
+        "vacant": True,
+        "multipleIncumbentsAllowed": False,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": auth_header,
+        "x-csrf-token": csrf_token,
+    }
+
+    upsert_resp = httpx.post(
+        f"{base_url}/upsert",
+        headers=headers,
+        params={"purgeType": "incremental", "$format": "json"},
+        json=payload,
+        timeout=15,
+    )
+
+    try:
+        result = upsert_resp.json()
+        if isinstance(result, dict):
+            result["position_code"] = position_code
+        return json.dumps(result)
+    except Exception:
+        return json.dumps({
+            "status_code": upsert_resp.status_code,
+            "position_code": position_code,
+            "message": upsert_resp.text,
+        })
+
 if __name__ == "__main__":
     import uvicorn
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
@@ -793,3 +1009,5 @@ if __name__ == "__main__":
         )
     else:
         mcp.run()
+
+
