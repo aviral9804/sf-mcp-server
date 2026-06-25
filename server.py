@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import base64
 from pathlib import Path
 from typing import Optional
 
@@ -15,8 +16,6 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 mcp = FastMCP("SuccessFactors", host="0.0.0.0")
 
-# In-memory cache for the Destination Service OAuth token so we don't
-# fetch a new one on every SF API call. Refreshed 60s before expiry.
 _token_cache: dict = {}
 
 
@@ -78,6 +77,34 @@ def _fetch_destination(name: str) -> dict:
     return resp.json()
 
 
+# Shared credential helper — single source of truth for SF auth
+
+def _get_sf_credentials() -> tuple[str, str]:
+    """Resolve SAP SuccessFactors base URL and Authorization header.
+
+    Returns:
+        (base_url, auth_header) — both ready to use directly in requests.
+
+    Resolution order:
+        1. BTP / Cloud Foundry  → reads VCAP_SERVICES and calls _fetch_destination("HRFF_Dev")
+        2. Local / dev          → reads SF_BASE_URL, SF_USERNAME, SF_PASSWORD from environment
+    """
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = f"Basic {credentials}"
+
+    return base_url, auth_header
+
+
 def _sf_get(entity: str, params: dict) -> dict:
     """
     GET request to SuccessFactors OData API.
@@ -85,30 +112,14 @@ def _sf_get(entity: str, params: dict) -> dict:
     - Locally: falls back to SF_BASE_URL / SF_USERNAME / SF_PASSWORD from .env.
     """
     params["$format"] = "json"
-
-    if os.environ.get("VCAP_SERVICES"):
-        dest = _fetch_destination("HRFF_Dev")
-        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
-        # authTokens[0] is the pre-resolved auth header — forward it as-is
-        auth_header = dest["authTokens"][0]["http_header"]["value"]
-        url = f"{base_url}/{entity}"
-        response = httpx.get(url, params=params, headers={"Authorization": auth_header}, timeout=30)
-    else:
-        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
-        username = os.environ.get("SF_USERNAME", "")
-        password = os.environ.get("SF_PASSWORD", "")
-        if not base_url or not username or not password:
-            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
-        url = f"{base_url}/{entity}"
-        response = httpx.get(url, params=params, auth=(username, password), timeout=30)
-
+    base_url, auth_header = _get_sf_credentials()
+    url = f"{base_url}/{entity}"
+    response = httpx.get(url, params=params, headers={"Authorization": auth_header}, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-# ---------------------------------------------------------------------------
 # XSUAA helpers (OAuth proxy)
-# ---------------------------------------------------------------------------
 
 def _xsuaa_creds() -> dict:
     """Read XSUAA credentials from VCAP_SERVICES (bound service sf_mcp-xsuaa)."""
@@ -121,12 +132,6 @@ def _xsuaa_creds() -> dict:
             return inst["credentials"]
     return instances[0]["credentials"]
 
-
-# ---------------------------------------------------------------------------
-# OAuth proxy routes — required for Claude.ai MCP custom connector
-# These proxy the OAuth flow to the bound XSUAA service instance.
-# Joule and other BTP callers are unaffected (they hit /sse directly).
-# ---------------------------------------------------------------------------
 
 @mcp.custom_route("/", methods=["GET"])
 async def health(request: Request) -> Response:
@@ -785,6 +790,14 @@ def sf_update_position(
     effective_start_date: str,
     position_title: str = None,
     job_code: str = None,
+    type: str = None,
+    position_title_field: str = None,
+    effective_status: str = None,
+    position_criticality: str = None,
+    vacant: bool = None,
+    multiple_incumbents_allowed: bool = None,
+    standard_hours: float = None,
+    target_fte: float = None,
 ) -> str:
     """Update the position title and/or job code of a position in SAP SuccessFactors.
     At least one of position_title or job_code must be provided.
@@ -794,23 +807,20 @@ def sf_update_position(
         effective_start_date: Effective date for the new record, YYYY-MM-DD (e.g. '2026-06-16')
         position_title: New position title to set (e.g. 'Data Scientist'). Optional.
         job_code: Job code to assign to the position (e.g. 'JC_1001'). Optional.
+        type: Position Type (e.g. 'REGULAR'). Optional.
+        position_title_field: Position Title field value (e.g. 'Data Scientist'). Optional.
+        effective_status: Status of the position (e.g. 'A' for Active, 'I' for Inactive). Optional.
+        position_criticality: Position Criticality (e.g. 'CRITICAL', 'NOT_CRITICAL'). Optional.
+        vacant: Whether the position is vacant (True/False). Optional.
+        multiple_incumbents_allowed: Whether multiple incumbents are allowed (True/False). Optional.
+        standard_hours: Weekly standard hours (e.g. 40.0). Optional.
+        target_fte: Target FTE headcount (e.g. 1.0). Optional.
     """
     if not position_title and not job_code:
         return json.dumps({"success": False, "message": "At least one of position_title or job_code must be provided."})
 
-    if os.environ.get("VCAP_SERVICES"):
-        dest = _fetch_destination("HRFF_Dev")
-        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
-        auth_header = dest["authTokens"][0]["http_header"]["value"]
-    else:
-        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
-        username = os.environ.get("SF_USERNAME", "")
-        password = os.environ.get("SF_PASSWORD", "")
-        if not base_url or not username or not password:
-            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
-        import base64
-        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-        auth_header = f"Basic {credentials}"
+    # --- Resolve credentials (single call) ---
+    base_url, auth_header = _get_sf_credentials()
 
     headers = {
         "Content-Type": "application/json",
@@ -853,6 +863,30 @@ def sf_update_position(
 
     if job_code:
         payload["jobCode"] = job_code
+
+    if type is not None:
+        payload["type"] = type
+
+    if position_title_field is not None:
+        payload["positionTitle"] = position_title_field
+
+    if effective_status is not None:
+        payload["effectiveStatus"] = effective_status
+
+    if position_criticality is not None:
+        payload["positionCriticality"] = position_criticality
+
+    if vacant is not None:
+        payload["vacant"] = vacant
+
+    if multiple_incumbents_allowed is not None:
+        payload["multipleIncumbentsAllowed"] = multiple_incumbents_allowed
+
+    if standard_hours is not None:
+        payload["standardHours"] = standard_hours
+
+    if target_fte is not None:
+        payload["targetFTE"] = target_fte
 
     upsert_resp = httpx.post(
         f"{base_url}/upsert",
@@ -914,20 +948,8 @@ def sf_create_position(
     rand_part = random.randint(0, 99)
     position_code = str(50000000 + (ts_part * 100 + rand_part) % 9999999)
 
-    # --- Auth + CSRF (same pattern as sf_update_position) ---
-    if os.environ.get("VCAP_SERVICES"):
-        dest = _fetch_destination("HRFF_Dev")
-        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
-        auth_header = dest["authTokens"][0]["http_header"]["value"]
-    else:
-        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
-        username = os.environ.get("SF_USERNAME", "")
-        password = os.environ.get("SF_PASSWORD", "")
-        if not base_url or not username or not password:
-            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
-        import base64
-        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-        auth_header = f"Basic {credentials}"
+    # --- Resolve credentials (single call) ---
+    base_url, auth_header = _get_sf_credentials()
 
     csrf_resp = httpx.get(
         f"{base_url}/Position",
@@ -1009,5 +1031,3 @@ if __name__ == "__main__":
         )
     else:
         mcp.run()
-
-
