@@ -2,7 +2,6 @@ import os
 import json
 import re
 import time
-import base64
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +15,8 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 mcp = FastMCP("SuccessFactors", host="0.0.0.0")
 
+# In-memory cache for the Destination Service OAuth token so we don't
+# fetch a new one on every SF API call. Refreshed 60s before expiry.
 _token_cache: dict = {}
 
 
@@ -92,7 +93,9 @@ def _get_sf_credentials() -> tuple[str, str]:
     if os.environ.get("VCAP_SERVICES"):
         dest = _fetch_destination("HRFF_Dev")
         base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        # authTokens[0] is the pre-resolved auth header — forward it as-is
         auth_header = dest["authTokens"][0]["http_header"]["value"]
+    
     else:
         base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
         username = os.environ.get("SF_USERNAME", "")
@@ -114,7 +117,7 @@ def _sf_get(entity: str, params: dict) -> dict:
     params["$format"] = "json"
     base_url, auth_header = _get_sf_credentials()
     url = f"{base_url}/{entity}"
-    response = httpx.get(url, params=params, headers={"Authorization": auth_header}, timeout=30)
+    response = httpx.get(url, params=params, auth=(username, password), timeout=30)
     response.raise_for_status()
     return response.json()
 
@@ -807,20 +810,23 @@ def sf_update_position(
         effective_start_date: Effective date for the new record, YYYY-MM-DD (e.g. '2026-06-16')
         position_title: New position title to set (e.g. 'Data Scientist'). Optional.
         job_code: Job code to assign to the position (e.g. 'JC_1001'). Optional.
-        type: Position Type (e.g. 'REGULAR'). Optional.
-        position_title_field: Position Title field value (e.g. 'Data Scientist'). Optional.
-        effective_status: Status of the position (e.g. 'A' for Active, 'I' for Inactive). Optional.
-        position_criticality: Position Criticality (e.g. 'CRITICAL', 'NOT_CRITICAL'). Optional.
-        vacant: Whether the position is vacant (True/False). Optional.
-        multiple_incumbents_allowed: Whether multiple incumbents are allowed (True/False). Optional.
-        standard_hours: Weekly standard hours (e.g. 40.0). Optional.
-        target_fte: Target FTE headcount (e.g. 1.0). Optional.
     """
     if not position_title and not job_code:
         return json.dumps({"success": False, "message": "At least one of position_title or job_code must be provided."})
 
-    # --- Resolve credentials (single call) ---
-    base_url, auth_header = _get_sf_credentials()
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        import base64
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = f"Basic {credentials}"
 
     headers = {
         "Content-Type": "application/json",
@@ -864,30 +870,6 @@ def sf_update_position(
     if job_code:
         payload["jobCode"] = job_code
 
-    if type is not None:
-        payload["type"] = type
-
-    if position_title_field is not None:
-        payload["positionTitle"] = position_title_field
-
-    if effective_status is not None:
-        payload["effectiveStatus"] = effective_status
-
-    if position_criticality is not None:
-        payload["positionCriticality"] = position_criticality
-
-    if vacant is not None:
-        payload["vacant"] = vacant
-
-    if multiple_incumbents_allowed is not None:
-        payload["multipleIncumbentsAllowed"] = multiple_incumbents_allowed
-
-    if standard_hours is not None:
-        payload["standardHours"] = standard_hours
-
-    if target_fte is not None:
-        payload["targetFTE"] = target_fte
-
     upsert_resp = httpx.post(
         f"{base_url}/upsert",
         headers=headers,
@@ -917,29 +899,40 @@ def sf_create_position(
     job_code: str,
     location: str,
     hiring_manager_user_id: str,
-    standard_hours: float = 40.0,
-    target_fte: float = 1.0,
+    position_type: str,
+    position_criticality: str,
+    effective_status: str,
+    vacant: str,
+    multiple_incumbents_allowed: str,
+    standard_hours: str = "40",
+    target_fte: str = "1",
+    parent_position: Optional[str] = None,
 ) -> str:
     """Create a brand-new Position in SAP SuccessFactors EC.
 
     An 8-digit position code is auto-generated in the range 50000000–59999999
     (reserved for agent-created positions; avoids collision with manually
     created codes which are typically in the 4xxxxxxx range).
-    The position is created as vacant=true, multipleIncumbentsAllowed=false.
 
     Args:
-        effective_start_date:     Effective date for the position, YYYY-MM-DD (e.g. '2026-01-01').
-        position_title:           Human-readable position title (e.g. 'Data Analyst').
-        company:                  Company code (e.g. 'US01').
-        business_unit:            Business Unit externalCode (e.g. '10001').
-        division:                 Division externalCode (e.g. '20001').
-        department:               Department externalCode (e.g. '30000054').
-        cost_center:              Cost Center code (e.g. '3000987654').
-        job_code:                 Job Code externalCode (e.g. 'Accountant').
-        location:                 Location externalCode (e.g. 'US01').
-        hiring_manager_user_id:   userId of the hiring manager (e.g. '6000002').
-        standard_hours:           Weekly standard hours (default: 40).
-        target_fte:               Target FTE headcount (default: 1).
+        effective_start_date:       Effective date for the position, YYYY-MM-DD (e.g. '2026-01-01').
+        position_title:             Human-readable position title (e.g. 'Data Analyst').
+        company:                    Company code (e.g. 'US01').
+        business_unit:              Business Unit externalCode (e.g. '10001').
+        division:                   Division externalCode (e.g. '20001').
+        department:                 Department externalCode (e.g. '30000054').
+        cost_center:                Cost Center code (e.g. '3000987654').
+        job_code:                   Job Code externalCode (e.g. 'Accountant').
+        location:                   Location externalCode (e.g. 'US01').
+        hiring_manager_user_id:     userId of the hiring manager (e.g. '6000002').
+        standard_hours:             Weekly standard hours (e.g. '40').
+        target_fte:                 Target FTE headcount (e.g. '1').
+        position_type:              Position type code (e.g. 'RP' for Regular Position).
+        position_criticality:       Position criticality code (e.g. '0', '1', '2').
+        effective_status:           Status of the position ('A' for Active, 'I' for Inactive).
+        vacant:                     Whether the position is vacant ('true' or 'false').
+        multiple_incumbents_allowed: Whether multiple incumbents are allowed ('true' or 'false').
+        parent_position:            Parent position externalCode for manager hierarchy (optional).
     """
     import random
 
@@ -948,9 +941,22 @@ def sf_create_position(
     rand_part = random.randint(0, 99)
     position_code = str(50000000 + (ts_part * 100 + rand_part) % 9999999)
 
-    # --- Resolve credentials (single call) ---
-    base_url, auth_header = _get_sf_credentials()
+    # --- Auth ---
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        import base64
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = f"Basic {credentials}"
 
+    # --- CSRF ---
     csrf_resp = httpx.get(
         f"{base_url}/Position",
         headers={"Authorization": auth_header, "x-csrf-token": "fetch"},
@@ -963,10 +969,17 @@ def sf_create_position(
 
     # --- Epoch date conversion ---
     from datetime import datetime, timezone
-    epoch_ms = int(datetime.strptime(effective_start_date, "%Y-%m-%d")
-                   .replace(tzinfo=timezone.utc)
-                   .timestamp() * 1000)
+    epoch_ms = int(
+        datetime.strptime(effective_start_date, "%Y-%m-%d")
+        .replace(tzinfo=timezone.utc)
+        .timestamp() * 1000
+    )
 
+    # --- Convert string booleans to actual booleans ---
+    vacant_bool = vacant.lower() == "true"
+    multiple_incumbents_bool = multiple_incumbents_allowed.lower() == "true"
+
+    # --- Payload ---
     payload = {
         "__metadata": {
             "uri": f"Position(code='{position_code}',effectiveStartDate=datetime'{effective_start_date}T00:00:00')",
@@ -986,9 +999,23 @@ def sf_create_position(
         "cust_hiringmanager": hiring_manager_user_id,
         "standardHours": standard_hours,
         "targetFTE": target_fte,
-        "vacant": True,
-        "multipleIncumbentsAllowed": False,
+        "type": position_type,
+        "positionCriticality": position_criticality,
+        "effectiveStatus": effective_status,
+        "vacant": vacant_bool,
+        "multipleIncumbentsAllowed": multiple_incumbents_bool,
     }
+
+    # --- Parent Position (optional nav property) ---
+    if parent_position:
+        payload["parentPosition"] = {
+            "__metadata": {
+                "uri": f"Position(code='{parent_position}',effectiveStartDate=datetime'{effective_start_date}T00:00:00')",
+                "type": "SFOData.Position",
+            },
+            "code": parent_position,
+            "effectiveStartDate": f"/Date({epoch_ms})/",
+        }
 
     headers = {
         "Content-Type": "application/json",
@@ -1016,6 +1043,515 @@ def sf_create_position(
             "position_code": position_code,
             "message": upsert_resp.text,
         })
+    
+@mcp.tool()
+def sf_get_position(
+    position_code: str,
+    expected_field: Optional[str] = None,
+    expected_value: Optional[str] = None,
+) -> str:
+    """Fetch a Position record from SuccessFactors by its externalCode.
+    Returns ALL fields from SF OData as-is.
+    Optionally verifies any single field by name — accepts both code or label values.
+
+    Args:
+        position_code:   externalCode of the position (e.g. '40001048')
+        expected_field:  Optional field name to verify (e.g. 'department', 'location', 'jobCode')
+        expected_value:  Expected value for the field — can be a code (e.g. '30000054') 
+                         or a label (e.g. 'Human Resource')
+    """
+    params = {
+        "$filter": f"code eq '{position_code}'",
+        "$orderby": "effectiveStartDate desc",
+        "$top": "1",
+    }
+    data = _sf_get("Position", params)
+    records = data.get("d", {}).get("results", [])
+
+    if not records:
+        return json.dumps({"error": f"Position '{position_code}' not found."})
+
+    pos = {k: v for k, v in records[0].items() if k != "__metadata"}
+
+    # If no verification requested — return everything
+    if not expected_field or not expected_value:
+        return json.dumps({"position": pos}, indent=2)
+
+    # Verification — match against any field value (code or label, case-insensitive)
+    actual_val = pos.get(expected_field)
+    expected_lower = expected_value.strip().lower()
+
+    # Check direct match (code) or label match across all string fields
+    direct_match = str(actual_val).strip().lower() == expected_lower if actual_val else False
+
+    # Also scan all field values for label match (in case label is stored in another field)
+    label_match_fields = {
+        k: v for k, v in pos.items()
+        if isinstance(v, str) and expected_lower in v.strip().lower()
+    }
+
+    passed = direct_match or bool(label_match_fields)
+
+    return json.dumps({
+        "position": pos,
+        "check": {
+            "field":         expected_field,
+            "expected":      expected_value,
+            "actual":        actual_val,
+            "pass":          passed,
+            "direct_match":  direct_match,
+            "label_matches": label_match_fields if not direct_match else {},
+        }
+    }, indent=2)
+
+# ---------------------------------------------------------------------------
+# TC03 — Decommissioning tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def ec_scan_positions(
+    department_id: Optional[str] = None,
+    country_codes: Optional[str] = None,
+    hiring_manager_user_id: Optional[str] = None,
+    company: Optional[str] = None,
+    business_unit: Optional[str] = None,
+    division: Optional[str] = None,
+    cost_center: Optional[str] = None,
+    position_type: Optional[str] = None,
+    location: Optional[str] = None,
+    vacant: Optional[bool] = None,
+) -> str:
+    """Scan active positions with flexible filtering across any combination of fields.
+    Returns vacant and occupied positions with incumbent info.
+    Use this for decommissioning workflows to identify positions that need to be
+    moved to a new department.
+
+    Args:
+        department_id:           externalCode of the source department (e.g. 'APAC_LEGACY')
+        country_codes:           Comma-separated ISO country codes to filter by (e.g. 'AU,SG').
+                                 If omitted, returns all positions matching other filters.
+        hiring_manager_user_id:  userId of the hiring manager (e.g. '6000002')
+        company:                 Company code (e.g. 'US01')
+        business_unit:           Business Unit externalCode (e.g. '10001')
+        division:                Division externalCode (e.g. '20001')
+        cost_center:             Cost Center code (e.g. '3000987654')
+        position_type:           Position type code (e.g. 'RP' for Regular Position)
+        location:                Location externalCode (e.g. 'AU01')
+        vacant:                  True for only vacant, False for only occupied
+    """
+    select = (
+        "code,externalName_defaultValue,jobCode,vacant,"
+        "department,businessUnit,division,costCenter,company,"
+        "positionType,location,parentPosition"
+    )
+
+    filters = ["positionCriticality ne 'I'"]
+
+    if department_id:
+        filters.append(f"department eq '{department_id}'")
+    if hiring_manager_user_id:
+        filters.append(f"cust_hiringmanager eq '{hiring_manager_user_id}'")
+    if company:
+        filters.append(f"company eq '{company}'")
+    if business_unit:
+        filters.append(f"businessUnit eq '{business_unit}'")
+    if division:
+        filters.append(f"division eq '{division}'")
+    if cost_center:
+        filters.append(f"costCenter eq '{cost_center}'")
+    if position_type:
+        filters.append(f"positionType eq '{position_type}'")
+    if location:
+        filters.append(f"location eq '{location}'")
+    if vacant is not None:
+        filters.append(f"vacant eq {'true' if vacant else 'false'}")
+    if country_codes:
+        codes = [c.strip().upper() for c in country_codes.split(",") if c.strip()]
+        if codes:
+            or_parts = " or ".join(f"locationNav/country eq '{c}'" for c in codes)
+            filters.append(f"({or_parts})")
+
+    combined_filter = " and ".join(filters)
+
+    all_positions: list = []
+    page_size = 100
+    skip = 0
+
+    while True:
+        params = {
+            "$filter": combined_filter,
+            "$select": select,
+            "$top": str(page_size),
+            "$skip": str(skip),
+        }
+        try:
+            data = _sf_get("Position", params)
+            raw = data.get("d", {}).get("results", [])
+            all_positions.extend(
+                [{k: v for k, v in p.items() if k != "__metadata"} for p in raw]
+            )
+            if len(raw) < page_size:
+                break
+            skip += page_size
+        except httpx.HTTPStatusError as exc:
+            # Retry without country filter if it caused a 400
+            if exc.response.status_code == 400 and country_codes:
+                country_codes = None
+                filters = [f for f in filters if "locationNav" not in f]
+                combined_filter = " and ".join(filters)
+                skip = 0
+                all_positions = []
+                continue
+            return json.dumps({
+                "error": f"SF returned {exc.response.status_code}",
+                "detail": exc.response.text[:500],
+            }, indent=2)
+
+    if not all_positions:
+        return json.dumps({
+            "total": 0,
+            "vacant_count": 0,
+            "occupied_count": 0,
+            "vacant": [],
+            "occupied": [],
+            "message": "No positions found.",
+        }, indent=2)
+
+    vacant_list = [p for p in all_positions if p.get("vacant") is True]
+    occupied_list = [p for p in all_positions if p.get("vacant") is not True]
+
+    # Look up incumbents for occupied positions
+    occupied_codes = [p["code"] for p in occupied_list if p.get("code")]
+    incumbent_map: dict = {}
+
+    if occupied_codes:
+        batch = occupied_codes[:30]
+        or_parts = " or ".join(f"position eq '{c}'" for c in batch)
+        try:
+            emp_data = _sf_get("EmpJob", {
+                "$filter": f"({or_parts}) and endDate eq datetime'9999-12-31T00:00:00'",
+                "$select": "userId,position,jobTitle",
+                "$top": "100",
+            })
+            for rec in emp_data.get("d", {}).get("results", []):
+                pc = rec.get("position", "")
+                incumbent_map.setdefault(pc, []).append({
+                    "userId": rec.get("userId"),
+                    "jobTitle": rec.get("jobTitle"),
+                })
+        except Exception:
+            try:
+                emp_data = _sf_get("EmpJob", {
+                    "$filter": f"({or_parts})",
+                    "$select": "userId,position,jobTitle,endDate",
+                    "$top": "200",
+                })
+                for rec in emp_data.get("d", {}).get("results", []):
+                    pc = rec.get("position", "")
+                    end = str(rec.get("endDate", "") or "")
+                    if "9999" in end or not end:
+                        incumbent_map.setdefault(pc, []).append({
+                            "userId": rec.get("userId"),
+                            "jobTitle": rec.get("jobTitle"),
+                        })
+            except Exception as exc:
+                incumbent_map["_lookup_error"] = str(exc)
+
+    for pos in occupied_list:
+        pos["incumbents"] = incumbent_map.get(pos.get("code", ""), [])
+
+    return json.dumps({
+        "total": len(all_positions),
+        "vacant_count": len(vacant_list),
+        "occupied_count": len(occupied_list),
+        "vacant": vacant_list,
+        "occupied": occupied_list,
+    }, indent=2)
+
+@mcp.tool()
+def sf_get_manager_position_count(
+    manager_user_id: str = None,
+    position_code: str = None,
+    person_id: str = None,
+) -> str:
+    """Count how many positions currently report to a manager via parentPosition.
+    Use this before reassigning positions to a new manager to check the span of control.
+    Returns the manager's own position code plus the full list of reporting positions.
+
+    Provide any one of: position_code, manager_user_id, or person_id.
+    Priority order: position_code > manager_user_id > person_id.
+    - position_code: used directly, no lookup needed.
+    - manager_user_id: position resolved via EmpJob (userId).
+    - person_id: userId is first resolved via PerPerson, then position via EmpJob.
+
+    Args:
+        manager_user_id: userId of the manager (e.g. '6000002'). 
+        position_code: externalCode of the manager's position (e.g. '40001874').
+        person_id: personId of the manager (e.g. '100002'). 
+    """
+    if not any([manager_user_id, position_code, person_id]):
+        return json.dumps({"error": "Provide at least one of: manager_user_id, position_code, or person_id."}, indent=2)
+
+    manager_position_code = position_code  # use directly if provided
+
+    # Step 1a — resolve userId from personId if needed
+    if not manager_position_code and not manager_user_id and person_id:
+        try:
+            per_data = _sf_get("PerPerson", {
+                "$filter": f"personId eq '{person_id}'",
+                "$select": "personId,userId",
+                "$top": "1",
+            })
+            records = per_data.get("d", {}).get("results", [])
+            if not records:
+                return json.dumps({
+                    "error": f"No user found for personId '{person_id}'"
+                }, indent=2)
+            manager_user_id = records[0].get("userId")
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, indent=2)
+
+        if not manager_user_id:
+            return json.dumps({
+                "error": f"personId '{person_id}' has no associated userId in PerPerson"
+            }, indent=2)
+
+    # Step 1b — resolve position code from EmpJob if position_code not provided
+    if not manager_position_code:
+        try:
+            emp_data = _sf_get("EmpJob", {
+                "$filter": f"userId eq '{manager_user_id}' and endDate eq datetime'9999-12-31T00:00:00'",
+                "$select": "userId,position",
+                "$top": "1",
+            })
+            records = emp_data.get("d", {}).get("results", [])
+            if not records:
+                # Fallback: get latest record regardless of endDate
+                emp_data = _sf_get("EmpJob", {
+                    "$filter": f"userId eq '{manager_user_id}'",
+                    "$select": "userId,position,endDate",
+                    "$orderby": "startDate desc",
+                    "$top": "1",
+                })
+                records = emp_data.get("d", {}).get("results", [])
+            if not records:
+                return json.dumps({
+                    "error": f"No EmpJob record found for userId '{manager_user_id}'"
+                }, indent=2)
+            manager_position_code = records[0].get("position")
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, indent=2)
+
+        if not manager_position_code:
+            return json.dumps({
+                "error": f"userId '{manager_user_id}' has no position assigned in EmpJob"
+            }, indent=2)
+
+    # Step 2 — find all positions reporting to this position code
+    try:
+        pos_data = _sf_get("Position", {
+            "$filter": f"parentPosition eq '{manager_position_code}' and positionCriticality ne 'I'",
+            "$select": "code,externalName_defaultValue,vacant,department",
+            "$top": "200",
+        })
+        positions = [
+            {k: v for k, v in p.items() if k != "__metadata"}
+            for p in pos_data.get("d", {}).get("results", [])
+        ]
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+
+    return json.dumps({
+        "person_id": person_id,
+        "manager_user_id": manager_user_id,
+        "manager_position_code": manager_position_code,
+        "current_position_count": len(positions),
+        "positions": positions,
+    }, indent=2)
+
+@mcp.tool()
+def sf_bulk_update_positions(
+    position_codes: str,
+    effective_start_date: str,
+    new_department: Optional[str] = None,
+    new_parent_position: Optional[str] = None,
+    new_job_code: Optional[str] = None,
+    new_position_title: Optional[str] = None,
+    new_company: Optional[str] = None,
+    new_business_unit: Optional[str] = None,
+    new_division: Optional[str] = None,
+    new_cost_center: Optional[str] = None,
+    new_location: Optional[str] = None,
+    new_hiring_manager_user_id: Optional[str] = None,
+    new_standard_hours: Optional[str] = None,
+    new_target_fte: Optional[str] = None,
+    new_position_type: Optional[str] = None,
+    new_position_criticality: Optional[str] = None,
+    new_vacant: Optional[bool] = None,
+    new_multiple_incumbents_allowed: Optional[bool] = None,
+    new_effective_status: Optional[str] = None,
+) -> str:
+    """Update any position fields across multiple positions in a single batch.
+    Applies the same changes to all positions in the list.
+    At least one of the new_* fields must be provided.
+
+    Args:
+        position_codes:                   Comma-separated position externalCodes (e.g. '40001,40002,40003')
+        effective_start_date:             Effective date for all updates, YYYY-MM-DD (e.g. '2026-07-01')
+        new_department:                   Department externalCode to move positions to (optional)
+        new_parent_position:              New parent position code for manager realignment (optional)
+        new_job_code:                     New job code to apply to all positions (optional)
+        new_position_title:               New title to apply to all positions (optional)
+        new_company:                      Company code (e.g. 'US01') (optional)
+        new_business_unit:                Business Unit externalCode (e.g. '10001') (optional)
+        new_division:                     Division externalCode (e.g. '20001') (optional)
+        new_cost_center:                  Cost Center code (e.g. '3000987654') (optional)
+        new_location:                     Location externalCode (e.g. 'US01') (optional)
+        new_hiring_manager_user_id:       userId of the hiring manager (e.g. '6000002') (optional)
+        new_standard_hours:               Weekly standard hours (e.g. '40') (optional)
+        new_target_fte:                   Target FTE headcount (e.g. '1') (optional)
+        new_position_type:                Position type code (e.g. 'RP' for Regular Position) (optional)
+        new_position_criticality:         Position criticality code (e.g. '0', '1', '2') (optional)
+        new_vacant:                       Whether the position is vacant (True/False) (optional)
+        new_multiple_incumbents_allowed:  Whether multiple incumbents are allowed (True/False) (optional)
+        new_effective_status:             Status of the position ('A' for Active, 'I' for Inactive) (optional)
+    """
+    codes = [c.strip() for c in position_codes.split(",") if c.strip()]
+    if not codes:
+        return json.dumps({"success": False, "message": "No position codes provided."})
+
+    if not any([
+        new_department, new_parent_position, new_job_code, new_position_title,
+        new_company, new_business_unit, new_division, new_cost_center,
+        new_location, new_hiring_manager_user_id, new_standard_hours, new_target_fte,
+        new_position_type, new_position_criticality, new_effective_status,
+        new_vacant is not None, new_multiple_incumbents_allowed is not None,
+    ]):
+        return json.dumps({"success": False, "message": "At least one of the new_* fields must be provided."})
+
+    # --- Auth ---
+    if os.environ.get("VCAP_SERVICES"):
+        dest = _fetch_destination("HRFF_Dev")
+        base_url = dest["destinationConfiguration"]["URL"].rstrip("/")
+        auth_header = dest["authTokens"][0]["http_header"]["value"]
+    else:
+        base_url = os.environ.get("SF_BASE_URL", "").rstrip("/")
+        username = os.environ.get("SF_USERNAME", "")
+        password = os.environ.get("SF_PASSWORD", "")
+        if not base_url or not username or not password:
+            raise ValueError("SF_BASE_URL, SF_USERNAME, and SF_PASSWORD must be set in environment")
+        import base64
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = f"Basic {credentials}"
+
+    # --- CSRF — fetch once for the whole batch ---
+    csrf_resp = httpx.get(
+        f"{base_url}/Position",
+        headers={"Authorization": auth_header, "x-csrf-token": "fetch"},
+        params={"$top": "1", "$format": "json"},
+        timeout=15,
+    )
+    csrf_token = csrf_resp.headers.get("x-csrf-token", "")
+    if not csrf_token:
+        return json.dumps({"success": False, "message": "CSRF token not returned by SF"})
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": auth_header,
+        "x-csrf-token": csrf_token,
+    }
+
+    from datetime import datetime, timezone
+    epoch_ms = int(
+        datetime.strptime(effective_start_date, "%Y-%m-%d")
+        .replace(tzinfo=timezone.utc)
+        .timestamp() * 1000
+    )
+
+    succeeded = []
+    failed = []
+
+    for code in codes:
+        payload = {
+            "__metadata": {
+                "uri": f"Position(code='{code}',effectiveStartDate=datetime'{effective_start_date}T00:00:00')",
+                "type": "SFOData.Position",
+            },
+            "code": code,
+            "effectiveStartDate": f"/Date({epoch_ms})/",
+        }
+
+        if new_department:
+            payload["department"] = new_department
+        if new_parent_position:
+            payload["parentPosition"] = {
+                "__metadata": {
+                    "uri": f"Position(code='{new_parent_position}',effectiveStartDate=datetime'{effective_start_date}T00:00:00')",
+                    "type": "SFOData.Position",
+                },
+                "code": new_parent_position,
+                "effectiveStartDate": f"/Date({epoch_ms})/",
+            }
+        if new_job_code:
+            payload["jobCode"] = new_job_code
+        if new_position_title:
+            payload["externalName_defaultValue"] = new_position_title
+            payload["externalName_en_US"] = new_position_title
+        if new_company:
+            payload["company"] = new_company
+        if new_business_unit:
+            payload["businessUnit"] = new_business_unit
+        if new_division:
+            payload["division"] = new_division
+        if new_cost_center:
+            payload["costCenter"] = new_cost_center
+        if new_location:
+            payload["location"] = new_location
+        if new_hiring_manager_user_id:
+            payload["hiringManager"] = new_hiring_manager_user_id
+        if new_standard_hours:
+            payload["standardHours"] = new_standard_hours
+        if new_target_fte:
+            payload["targetFTE"] = new_target_fte
+        if new_position_type:
+            payload["type"] = new_position_type
+        if new_position_criticality:
+            payload["positionCriticality"] = new_position_criticality
+        if new_vacant is not None:
+            payload["vacant"] = new_vacant
+        if new_multiple_incumbents_allowed is not None:
+            payload["multipleIncumbentsAllowed"] = new_multiple_incumbents_allowed
+        if new_effective_status:
+            payload["effectiveStatus"] = new_effective_status
+
+        try:
+            resp = httpx.post(
+                f"{base_url}/upsert",
+                headers=headers,
+                params={"purgeType": "incremental", "$format": "json"},
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code in (200, 201, 204):
+                succeeded.append(code)
+            else:
+                failed.append({
+                    "code": code,
+                    "status": resp.status_code,
+                    "detail": resp.text[:300],
+                })
+        except Exception as exc:
+            failed.append({"code": code, "error": str(exc)})
+
+    return json.dumps({
+        "success": len(failed) == 0,
+        "total": len(codes),
+        "success_count": len(succeeded),
+        "fail_count": len(failed),
+        "succeeded": succeeded,
+        "failed": failed,
+    }, indent=2)
 
 if __name__ == "__main__":
     import uvicorn
@@ -1031,3 +1567,5 @@ if __name__ == "__main__":
         )
     else:
         mcp.run()
+
+
